@@ -7,6 +7,8 @@ services:
       - "8000:8000"
     environment:
       DIV_DB: /data/split.sqlite3
+      # Same named volume, but outside SQLite: keep it with the DB on backups.
+      DEID_KEY_FILE: /data/deid.key
       SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
     volumes:
       - split-data:/data

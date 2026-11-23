@@ -22,6 +22,39 @@
       </div>
     </div>
 
+    <div class="deid-box {% if state.deid.active %}active{% endif %}">
+      <div>
+        <h2>本轮去标识</h2>
+        {% if state.deid.active %}
+          <p>
+            <span class="tag good">已生效</span>
+            业务表中的用户原编号已替换为不可逆代号（{{ state.deid.activated_users }} 条），
+            后续报送也只保存代号。生效时间 {{ state.deid.activated_at }}。
+          </p>
+          {% if not state.deid.key_ok %}
+            <div class="banner flag">
+              去标识密钥不可用或与本轮不匹配：已暂停接收新报送，请恢复密钥或重置本轮。
+            </div>
+          {% endif %}
+        {% else %}
+          <p>
+            <span class="tag wait">未生效</span>
+            当前仍保存用户原编号。启用后，已收明细与处理中接收的名单都会改用本轮固定代号，
+            后续报送只保存代号；同一编号在本轮内代号固定，换轮后代号不同。
+          </p>
+        {% endif %}
+      </div>
+      <div class="actions">
+        {% if not state.deid.active %}
+          <form method="post" action="{{ url_for('enable_deid') }}" class="inline-form"
+                onsubmit="return confirm('启用后本轮业务表只保存不可逆代号，无法恢复原编号。确定继续？');">
+            <input type="hidden" name="round_serial" value="{{ state.deid.round_serial }}">
+            <button type="submit" class="button">启用本轮去标识</button>
+          </form>
+        {% endif %}
+      </div>
+    </div>
+
     {% if state.earliest_flag %}
       <div class="banner flag">
         最早触发分流异常的期次：<strong>第 {{ state.earliest_flag }} 期</strong>

@@ -8,7 +8,11 @@ The workflow is deliberately small:
 * complete consecutive prefixes are verified against the cumulative
   binomial distribution implied by the plan,
 * every verification records the observed cumulative B count, an exact
-  two-sided p-value and whether it crosses the Bonferroni threshold.
+  two-sided p-value and whether it crosses the Bonferroni threshold,
+* at any point (even before every list is in) the round can be switched to
+  de-identified storage: original ids in ``assignments`` are replaced by
+  irreversible, round-scoped HMAC codes, and later submissions are stored as
+  codes on arrival.  Verification numbers do not change.
 
 Run with ``gunicorn`` (see ``Dockerfile`` / ``compose.yaml``) or with
 ``flask --app app run`` for development.
@@ -18,9 +22,11 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import hmac
 import io
 import os
 import random
+import secrets
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -63,6 +69,11 @@ app.config.update(
     SECRET_KEY=os.environ.get("SECRET_KEY", "dev-only-secret-change-me"),
     MAX_CONTENT_LENGTH=MAX_CSV_BYTES + 64 * 1024,
     DB_PATH=DEFAULT_DB,
+    # Optional explicit override.  By default the key lives next to the
+    # database (``<db dir>/deid.key``) so the compose named volume keeps it
+    # across restarts.  It is deliberately *outside* SQLite: a copy of the
+    # database alone cannot be used to reverse codes back to user ids.
+    DEID_KEY_PATH=os.environ.get("DEID_KEY_FILE"),
 )
 app.jinja_env.globals.update(
     MAX_PERIODS=MAX_PERIODS,
@@ -77,6 +88,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS round_meta (
     id           INTEGER PRIMARY KEY CHECK (id = 1),
     periods      INTEGER NOT NULL CHECK (periods BETWEEN 1 AND 8),
+    round_serial INTEGER NOT NULL DEFAULT 1,
     configured_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
@@ -115,6 +127,18 @@ CREATE TABLE IF NOT EXISTS results (
     flagged        INTEGER NOT NULL CHECK (flagged IN (0, 1)),
     verified_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+
+-- Whether original user ids have been replaced by irreversible round codes.
+-- The activated round serial is stored so a switch started for an old round
+-- can never mark a later (reset) round as de-identified.
+CREATE TABLE IF NOT EXISTS deid_state (
+    id             INTEGER PRIMARY KEY CHECK (id = 1),
+    active         INTEGER NOT NULL CHECK (active IN (0, 1)),
+    round_serial   INTEGER NOT NULL DEFAULT 0,
+    activated_at   TEXT,
+    activated_users INTEGER NOT NULL DEFAULT 0,
+    key_check      TEXT
+);
 """
 
 
@@ -140,6 +164,39 @@ _schema_ready_paths: set[str] = set()
 
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    migrate_schema(conn)
+
+
+def migrate_schema(conn: sqlite3.Connection) -> None:
+    """Upgrade databases created by earlier versions in place.
+
+    ``CREATE TABLE IF NOT EXISTS`` leaves an existing ``round_meta`` alone, so
+    columns added later must be filled in explicitly.  This is idempotent and
+    cheap, which matters because every worker calls it once.
+    """
+    columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(round_meta)")
+    }
+    if "round_serial" not in columns:
+        try:
+            conn.execute(
+                "ALTER TABLE round_meta ADD COLUMN round_serial INTEGER NOT NULL DEFAULT 1"
+            )
+        except sqlite3.OperationalError:
+            # A concurrent worker added it first.
+            pass
+    deid_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(deid_state)")
+    }
+    if "key_check" not in deid_columns:
+        try:
+            conn.execute("ALTER TABLE deid_state ADD COLUMN key_check TEXT")
+        except sqlite3.OperationalError:
+            pass
+    conn.execute(
+        "INSERT OR IGNORE INTO deid_state (id, active, round_serial, activated_users) "
+        "VALUES (1, 0, 0, 0)"
+    )
 
 
 def get_db() -> sqlite3.Connection:
@@ -194,6 +251,354 @@ def round_periods(db: sqlite3.Connection) -> Optional[int]:
     return int(row["periods"]) if row else None
 
 
+def round_serial(db: sqlite3.Connection) -> int:
+    """Monotonic identifier of the current round.
+
+    Reset bumps it, so a de-identification switch that was prepared for the
+    previous round can be recognised as stale and refused.
+    """
+    row = db.execute("SELECT round_serial FROM round_meta WHERE id = 1").fetchone()
+    return int(row["round_serial"]) if row else 0
+
+
+def deid_status(db: sqlite3.Connection) -> dict:
+    """Current de-identification state, scoped to the live round."""
+    row = db.execute(
+        "SELECT active, round_serial, activated_at, activated_users, key_check "
+        "FROM deid_state WHERE id = 1"
+    ).fetchone()
+    serial = round_serial(db)
+    active = bool(row and row["active"] and int(row["round_serial"]) == serial)
+    status = {
+        "active": active,
+        "round_serial": serial,
+        "activated_at": row["activated_at"] if active else None,
+        "activated_users": int(row["activated_users"]) if active else 0,
+        "key_check": row["key_check"] if active else None,
+        "key_ok": True,
+    }
+    if active:
+        try:
+            key = load_deid_key(create=False)
+        except (OSError, DeidError):
+            key = None
+        status["key_ok"] = bool(key) and deid_key_check(key) == row["key_check"]
+    return status
+
+
+# ---------------------------------------------------------------------------
+# De-identification helpers
+# ---------------------------------------------------------------------------
+
+DEID_CODE_PREFIX = "deid-"
+DEID_CODE_HEX = 32  # 128 bits of HMAC-SHA256 output
+DEID_KEY_BYTES = 32
+_KEY_CHECK_CONTEXT = b"split-verify-deid-key-check\x00"
+
+
+class DeidError(RuntimeError):
+    """A failure that must abort a de-identification switch."""
+
+
+def deid_key_path() -> str:
+    configured = current_app.config.get("DEID_KEY_PATH")
+    if configured:
+        return configured
+    db_dir = os.path.dirname(os.path.abspath(current_app.config["DB_PATH"]))
+    return os.path.join(db_dir, "deid.key")
+
+
+def load_deid_key(create: bool = False) -> Optional[bytes]:
+    """Read the HMAC key, optionally creating it atomically with mode 0600.
+
+    The key lives beside the database rather than inside it.  A leaked copy of
+    the SQLite file therefore cannot be used to turn codes back into user ids,
+    while the compose named volume keeps both across restarts.
+    """
+    path = deid_key_path()
+    try:
+        with open(path, "rb") as handle:
+            key = handle.read().strip()
+        if not key:
+            raise DeidError("去标识密钥文件为空")
+        return key
+    except FileNotFoundError:
+        if not create:
+            return None
+
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    key = secrets.token_hex(DEID_KEY_BYTES).encode("ascii")
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        # Another worker won the race; use the key it wrote.
+        return load_deid_key(create=False)
+    try:
+        os.write(fd, key + b"\n")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return key
+
+
+def deid_key_check(key: bytes) -> str:
+    return hashlib.sha256(_KEY_CHECK_CONTEXT + key).hexdigest()
+
+
+def deid_code(key: bytes, serial: int, user_id: str) -> str:
+    """Deterministic, round-scoped pseudonym for ``user_id``.
+
+    * same round + same user id  -> same code (dedupe keeps working),
+    * different round            -> different code (``serial`` is in the MAC),
+    * without ``key``            -> cannot be re-derived from the code.
+    """
+    message = f"{serial}\x00{user_id}".encode("utf-8")
+    digest = hmac.new(key, message, hashlib.sha256).hexdigest()[:DEID_CODE_HEX]
+    return f"{DEID_CODE_PREFIX}{digest}"
+
+
+def upload_checksum(
+    rows: Sequence[tuple[str, str]], key: Optional[bytes], serial: int
+) -> str:
+    """Content fingerprint used for re-upload detection.
+
+    Without de-identification this is the historical plain SHA-256 over the
+    original ``user_id + group`` lines, so existing databases stay compatible.
+    Once de-identification is active the same fingerprint is keyed: otherwise
+    a small user-id space could be brute-forced from the checksum alone, which
+    would defeat the point of storing codes.
+    """
+    canonical = "\n".join(
+        f"{user_id}\t{group}"
+        for user_id, group in sorted(rows, key=lambda r: (r[0], r[1]))
+    ).encode("utf-8")
+    if key is None:
+        return hashlib.sha256(canonical).hexdigest()
+    message = f"{serial}\x00".encode("utf-8") + canonical
+    return hmac.new(key, message, hashlib.sha256).hexdigest()
+
+
+def stored_user_ids(
+    db: sqlite3.Connection, parsed: ParsedUpload
+) -> tuple[list[str], Optional[str], Optional[bytes], int]:
+    """Map parsed original ids to what should be stored, or explain why not.
+
+    Returns ``(stored_ids, error, key, serial)``.  ``key`` is ``None`` while
+    de-identification is off; when it is on, callers must use the key (and the
+    round ``serial``) for the stored content fingerprint as well.
+    """
+    status = deid_status(db)
+    if not status["active"]:
+        return [row.user_id for row in parsed.rows], None, None, status["round_serial"]
+    try:
+        key = load_deid_key(create=False)
+    except (OSError, DeidError) as exc:
+        return (
+            [],
+            f"去标识已生效但密钥不可用（{exc}），拒绝以原编号入库；请恢复密钥或重置本轮。",
+            None,
+            status["round_serial"],
+        )
+    if key is None:
+        return (
+            [],
+            "去标识已生效但密钥文件缺失，拒绝以原编号入库；请恢复密钥或重置本轮。",
+            None,
+            status["round_serial"],
+        )
+    if deid_key_check(key) != status["key_check"]:
+        return (
+            [],
+            "去标识已生效但密钥与本轮不匹配，拒绝以原编号入库；请恢复密钥或重置本轮。",
+            None,
+            status["round_serial"],
+        )
+    codes = [
+        deid_code(key, status["round_serial"], row.user_id) for row in parsed.rows
+    ]
+    return codes, None, key, status["round_serial"]
+
+
+@dataclass
+class DeidOutcome:
+    status: str  # "activated" | "active" | "error"
+    message: str
+    converted: int = 0
+
+
+def enable_deidentification(expected_serial: Optional[int] = None) -> DeidOutcome:
+    """Replace stored user ids with irreversible round codes in one transaction.
+
+    Concurrent uploads serialise on ``BEGIN IMMEDIATE``: an upload either
+    commits before the switch (and gets converted) or after it (and is stored
+    as codes straight away).  Any failure rolls everything back, so the round
+    keeps accepting submissions with original ids exactly as before.
+
+    The key is only created *after* confirming the round is not already
+    active.  Otherwise a missing key would be silently replaced by a fresh one
+    that cannot reproduce the codes already in the database.
+    """
+    db = get_db()
+    try:
+        existing_key = load_deid_key(create=False)
+    except (OSError, DeidError) as exc:
+        return DeidOutcome(
+            "error", f"去标识切换失败：无法读取密钥（{exc}）。本轮仍按原编号报送。"
+        )
+    existing_check = deid_key_check(existing_key) if existing_key else None
+
+    last_error: Optional[BaseException] = None
+    for attempt in range(6):
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            if round_periods(db) is None:
+                _rollback(db)
+                return DeidOutcome("error", "尚未固定本轮计划，无法启用去标识。")
+
+            serial = round_serial(db)
+            if expected_serial is not None and int(expected_serial) != serial:
+                _rollback(db)
+                return DeidOutcome(
+                    "error",
+                    "本轮已更换（可能已重置），旧的去标识请求不再生效，请刷新页面后重试。",
+                )
+
+            state = db.execute(
+                "SELECT active, round_serial, activated_users, key_check "
+                "FROM deid_state WHERE id = 1"
+            ).fetchone()
+            if (
+                state is not None
+                and int(state["active"])
+                and int(state["round_serial"]) == serial
+            ):
+                _rollback(db)
+                count = int(state["activated_users"])
+                # Another worker may have created the key after our first read;
+                # re-read before calling it a mismatch.
+                check = existing_check
+                if check is None:
+                    try:
+                        retry_key = load_deid_key(create=False)
+                    except (OSError, DeidError):
+                        retry_key = None
+                    if retry_key is not None:
+                        check = deid_key_check(retry_key)
+                if check != state["key_check"]:
+                    return DeidOutcome(
+                        "error",
+                        "本轮去标识已生效，但当前密钥缺失或与生效时不一致；未做任何改动。"
+                        "请恢复原密钥（deid.key）或重置本轮后重新启用。",
+                        count,
+                    )
+                return DeidOutcome(
+                    "active",
+                    f"本轮去标识已生效（{count} 条记录使用代号），未做任何改动。",
+                    count,
+                )
+
+            if existing_key is None:
+                try:
+                    key = load_deid_key(create=True)
+                except (OSError, DeidError) as exc:
+                    _rollback(db)
+                    return DeidOutcome(
+                        "error",
+                        f"去标识切换失败：无法准备密钥（{exc}）。本轮仍按原编号报送。",
+                    )
+            else:
+                key = existing_key
+            assert key is not None
+            key_check = deid_key_check(key)
+
+            rows = db.execute(
+                "SELECT user_id, period, grp FROM assignments"
+            ).fetchall()
+            code_for_user: dict[str, str] = {}
+            user_for_code: dict[str, str] = {}
+            replacements: list[tuple[str, int, str]] = []
+            per_period: dict[int, list[tuple[str, str]]] = {}
+            for row in rows:
+                original = str(row["user_id"])
+                code = code_for_user.get(original)
+                if code is None:
+                    code = deid_code(key, serial, original)
+                    previous = user_for_code.get(code)
+                    if previous is not None and previous != original:
+                        raise DeidError("代号冲突")
+                    code_for_user[original] = code
+                    user_for_code[code] = original
+                period = int(row["period"])
+                grp = str(row["grp"])
+                replacements.append((code, period, grp))
+                per_period.setdefault(period, []).append((original, grp))
+
+            # Replace in one shot rather than updating primary keys in place;
+            # rollback restores the original ids if anything fails.
+            db.execute("DELETE FROM assignments")
+            db.executemany(
+                "INSERT INTO assignments (user_id, period, grp) VALUES (?, ?, ?)",
+                replacements,
+            )
+            # The upload fingerprints were plain hashes of the original ids;
+            # key them now so the checksums cannot be brute-forced either.
+            # Same upload content + same key still yields "duplicate" on a
+            # re-upload of the original CSV.
+            for period, pairs in per_period.items():
+                checksum = upload_checksum(pairs, key, serial)
+                db.execute(
+                    "UPDATE uploads SET checksum = ? WHERE period = ?",
+                    (checksum, period),
+                )
+            db.execute(
+                "INSERT INTO deid_state "
+                "(id, active, round_serial, activated_at, activated_users, key_check) "
+                "VALUES (1, 1, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "active = 1, round_serial = excluded.round_serial, "
+                "activated_at = excluded.activated_at, "
+                "activated_users = excluded.activated_users, "
+                "key_check = excluded.key_check",
+                (serial, len(replacements), key_check),
+            )
+            db.execute("COMMIT")
+            return DeidOutcome(
+                "activated",
+                f"本轮去标识已生效：{len(replacements)} 条已收明细改用不可逆代号，"
+                "后续报送也只保存代号；核验结果不受影响。",
+                len(replacements),
+            )
+        except sqlite3.IntegrityError as exc:
+            _rollback(db)
+            last_error = exc
+            if attempt < 2:
+                continue
+            return DeidOutcome(
+                "error", "去标识切换失败（代号冲突），本轮仍按原编号报送。"
+            )
+        except sqlite3.OperationalError as exc:
+            _rollback(db)
+            last_error = exc
+            if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                time.sleep(0.05 * (attempt + 1) + random.random() * 0.02)
+                continue
+            return DeidOutcome(
+                "error", f"去标识切换失败（{exc}），本轮仍按原编号报送。"
+            )
+        except DeidError as exc:
+            _rollback(db)
+            return DeidOutcome(
+                "error", f"去标识切换失败（{exc}），本轮仍按原编号报送。"
+            )
+        except Exception:
+            _rollback(db)
+            raise
+
+    return DeidOutcome(
+        "error", f"数据库繁忙，去标识切换未执行，本轮仍按原编号报送（{last_error}）。"
+    )
+
+
 def load_plan(db: sqlite3.Connection) -> list[sqlite3.Row]:
     return list(db.execute("SELECT period, planned_users, prob_b FROM plan ORDER BY period"))
 
@@ -240,6 +645,7 @@ def round_state(db: sqlite3.Connection) -> dict:
             "threshold": None,
             "earliest_flag": None,
             "locked": False,
+            "deid": deid_status(db),
             "max_periods": MAX_PERIODS,
             "total_users": TOTAL_USERS,
         }
@@ -276,6 +682,7 @@ def round_state(db: sqlite3.Connection) -> dict:
         "threshold": verification_threshold(periods),
         "earliest_flag": earliest_flag,
         "locked": plan_is_locked(db),
+        "deid": deid_status(db),
         "max_periods": MAX_PERIODS,
         "total_users": TOTAL_USERS,
     }
@@ -303,7 +710,6 @@ class UploadRow:
 class ParsedUpload:
     rows: tuple[UploadRow, ...]
     b_count: int
-    checksum: str
 
 
 def _normalise_header(value: str) -> str:
@@ -363,14 +769,9 @@ def parse_csv(raw: bytes) -> ParsedUpload:
     if not rows:
         raise CSVError("CSV 没有数据行")
 
-    canonical = "\n".join(
-        f"{row.user_id}\t{row.group}" for row in sorted(rows, key=lambda r: (r.user_id, r.group))
-    )
-    checksum = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     return ParsedUpload(
         rows=tuple(rows),
         b_count=sum(1 for row in rows if row.group == "B"),
-        checksum=checksum,
     )
 
 
@@ -493,13 +894,25 @@ def store_upload(period: int, parsed: ParsedUpload) -> UploadOutcome:
                     f"人数不符：该期计划 {expected_rows} 人，CSV 实际 {len(parsed.rows)} 人",
                 )
 
+            # Map to what will actually be stored.  While de-identification is
+            # off this is the original ids and an unkeyed fingerprint; once it
+            # is on the ids are round-scoped codes and the fingerprint is
+            # keyed, so neither can be inverted from the database alone.
+            stored_ids, deid_error, deid_key, serial = stored_user_ids(db, parsed)
+            if deid_error is not None:
+                _rollback(db)
+                return UploadOutcome("error", deid_error)
+            checksum = upload_checksum(
+                [(row.user_id, row.group) for row in parsed.rows], deid_key, serial
+            )
+
             existing = db.execute(
                 "SELECT checksum, row_count, b_count FROM uploads WHERE period = ?",
                 (period,),
             ).fetchone()
             if existing is not None:
                 _rollback(db)
-                if existing["checksum"] == parsed.checksum:
+                if existing["checksum"] == checksum:
                     return UploadOutcome(
                         "duplicate",
                         f"第 {period} 期相同明细已接收，本次未重复计入。",
@@ -518,24 +931,31 @@ def store_upload(period: int, parsed: ParsedUpload) -> UploadOutcome:
                     "SELECT user_id FROM assignments WHERE period <> ?", (period,)
                 )
             }
-            conflicts = [row.user_id for row in parsed.rows if row.user_id in other_users]
+            conflicts = [uid for uid in stored_ids if uid in other_users]
             if conflicts:
                 _rollback(db)
-                sample = ", ".join(sorted(conflicts)[:5])
-                more = " 等" if len(conflicts) > 5 else ""
+                # Never echo a stored code as if it were a user id: report the
+                # original ids the data team actually sent.
+                original = [
+                    row.user_id
+                    for row, uid in zip(parsed.rows, stored_ids)
+                    if uid in other_users
+                ]
+                sample = ", ".join(sorted(original)[:5])
+                more = " 等" if len(original) > 5 else ""
                 return UploadOutcome(
                     "error",
-                    f"拒收：{len(conflicts)} 个用户编号已出现在其他期（{sample}{more}），每人全程只计一次。",
+                    f"拒收：{len(original)} 个用户编号已出现在其他期（{sample}{more}），每人全程只计一次。",
                 )
 
             db.execute(
                 "INSERT INTO uploads (period, checksum, row_count, b_count) "
                 "VALUES (?, ?, ?, ?)",
-                (period, parsed.checksum, len(parsed.rows), parsed.b_count),
+                (period, checksum, len(parsed.rows), parsed.b_count),
             )
             db.executemany(
                 "INSERT INTO assignments (user_id, period, grp) VALUES (?, ?, ?)",
-                [(row.user_id, period, row.group) for row in parsed.rows],
+                zip(stored_ids, [period] * len(stored_ids), [row.group for row in parsed.rows]),
             )
             verified = recompute_results(db)
             db.execute("COMMIT")
@@ -743,12 +1163,46 @@ def reset_round():
         db.execute("DELETE FROM results")
         db.execute("DELETE FROM assignments")
         db.execute("DELETE FROM uploads")
+        # A new round gets a fresh serial and starts without de-identification.
+        # A switch request prepared for the old round can no longer apply,
+        # because its serial no longer matches.
+        db.execute(
+            "UPDATE round_meta SET round_serial = round_serial + 1 WHERE id = 1"
+        )
+        db.execute(
+            "UPDATE deid_state SET active = 0, round_serial = 0, activated_at = NULL, "
+            "activated_users = 0, key_check = NULL WHERE id = 1"
+        )
         db.execute("COMMIT")
     except Exception:
         _rollback(db)
         raise
-    flash("已清空本轮上传明细与核验结果，计划保留且可重新调整。", "success")
+    flash("已清空本轮上传明细与核验结果，计划保留且可重新调整；新一轮需重新启用去标识。", "success")
     return redirect(url_for("plan"))
+
+
+@app.post("/round/deid")
+def enable_deid():
+    """Switch the current round to code-only storage.
+
+    Safe to call repeatedly: if the current round is already de-identified
+    the response is a plain "already active" confirmation and nothing is
+    written.  A stale request from before a reset is refused.  The page always
+    sends the serial it rendered, so a missing/garbled one is treated as
+    invalid rather than as "any round".
+    """
+    expected_serial_text = request.form.get("round_serial", "").strip()
+    try:
+        expected_serial = int(expected_serial_text)
+    except ValueError:
+        flash("去标识请求无效（轮次标识不正确），请刷新页面后重试。", "error")
+        return redirect(url_for("index"))
+    outcome = enable_deidentification(expected_serial)
+    if outcome.status in ("activated", "active"):
+        flash(outcome.message, "success")
+    else:
+        flash(outcome.message, "error")
+    return redirect(url_for("index"))
 
 
 @app.route("/period/<int:period_no>", methods=["GET", "POST"])

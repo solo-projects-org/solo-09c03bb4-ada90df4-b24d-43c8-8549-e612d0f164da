@@ -15,6 +15,21 @@
 
   <div class="upload-box">
     <h2>上传本期明细</h2>
+    {% if state.deid.active %}
+      {% if state.deid.key_ok %}
+        <p class="muted">
+          本轮去标识已生效：CSV 仍按用户编号填写，入库时自动换成本轮固定代号；
+          重传比对与跨期查重仍按原始编号判断。
+        </p>
+      {% else %}
+        <div class="banner flag">去标识密钥不可用，本期暂时拒收；请恢复密钥或重置本轮。</div>
+      {% endif %}
+    {% else %}
+      <p class="muted">
+        本轮尚未启用去标识，用户编号会按原样保存。可在
+        <a href="{{ url_for('index') }}">总览</a>启用。
+      </p>
+    {% endif %}
     <p class="muted">CSV 需含用户编号与组别两列（A/B）；人数须等于 {{ plan_row.planned_users }}，用户编号全程唯一。</p>
     <form method="post" enctype="multipart/form-data" class="inline-form">
       <input type="file" name="file" accept=".csv,text/csv">
